@@ -18,22 +18,36 @@ r"""Tool to generate the dataset community catalog documentation.
 
 import argparse
 import dataclasses
+import datetime
 import json
 import os
+import re
 import textwrap
-from typing import Any, Iterator, List, Mapping, MutableMapping, Sequence, Tuple
+from typing import Any, Iterator, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 from absl import app
+from absl import flags
 from absl.flags import argparse_flags
 
 import tensorflow_datasets as tfds
 from tensorflow_datasets.core import utils
 from tensorflow_datasets.core.community import register_package
 from tensorflow_datasets.core.github_api import github_path
+from tensorflow_datasets.core.proto import dataset_info_pb2
+from tensorflow_datasets.core.proto import feature_pb2
 from tensorflow_datasets.core.utils import gcs_utils
+from tensorflow_datasets.core.utils import py_utils
 import yaml
 
 DatasetPackage = register_package.DatasetPackage
+
+FLAGS = flags.FLAGS
+
+local_cache = flags.DEFINE_string(
+    name='local_cache',
+    required=False,
+    help=('If specified, where to store temporarily downloaded files so that '
+          'they can be reused when running multiple times.'))
 
 _INDEX_TEMPLATE_PATH = 'scripts/documentation/templates/community_catalog_overview.md'
 _DATASET_DETAILS_TEMPLATE_PATH = 'scripts/documentation/templates/community_namespace_dataset.md'
@@ -53,15 +67,25 @@ def _parse_flags(_) -> argparse.Namespace:
   return parser.parse_args()
 
 
-def _load_template(path: str) -> str:
-  return tfds.core.tfds_path(path).read_text()
+def _load_template(template_path: str) -> str:
+  return tfds.core.tfds_path(template_path).read_text()
 
 
-def _to_toc_yaml(title: str, path: str, page: str) -> Mapping[str, Any]:
+def _to_toc_yaml(
+    *,
+    title: str,
+    relative_path: str,
+    page: str,
+) -> Mapping[str, Any]:
   return {
       'title': title,
-      'path': os.path.join(path, page),
+      'path': os.path.join(relative_path, page),
   }
+
+
+def _clean_up_text(text: str) -> str:
+  """Removes illegal characters from the given text."""
+  return re.sub(r'```', '', text).strip()
 
 
 @dataclasses.dataclass()
@@ -87,24 +111,126 @@ class DatasetDocumentation:
 
   @property
   def tfds_id(self) -> str:
+    """Returns the ID to use when loading this dataset in TFDS."""
     return str(self.dataset.name)
 
   @property
   def name(self) -> str:
     return self.dataset.name.name
 
+  @property
+  def namespace(self) -> str:
+    return self.dataset.name.namespace
+
   def code_url(self, title: str = 'Code') -> str:
     return f'[{title}]({self.dataset.source.root_path})'
+
+  def to_namespace_overview(self) -> str:
+    """Returns the entry to be shown in the overview for a single namespace."""
+    template = textwrap.dedent('*  [{dataset}]({namespace}/{dataset}.md)')
+    return template.format(
+        dataset=self.name,
+        namespace=self.namespace,
+    )
 
   def to_details_markdown(self) -> str:
     """"Markdown to be shown on the details page for the namespace."""
     extra_links = self.format_extra_links(prefix='*   ', infix='\n')
     return self.templates.dataset_details_template.format(
         name=self.name,
-        namespace=self.dataset.name.namespace,
+        description=self.documentation(),
+        namespace=self.namespace,
         tfds_id=self.tfds_id,
         references_bulleted_list=extra_links,
     )
+
+  def dataset_info_per_config(
+      self) -> Mapping[str, dataset_info_pb2.DatasetInfo]:
+    return {}
+
+  def documentation(self) -> str:
+    """Returns detailed documentation for all configs of this dataset."""
+    # TODO(weide): if e.g. the description contains markdown chars, then it messes up the page.
+    # TODO(weide): how to format citation?
+    header_template = '## {config_name}'
+    template = textwrap.dedent("""
+      Use the following command to load this dataset in TFDS:
+
+      ```python
+      ds = tfds.load('{tfds_id}')
+      ```
+
+      *   **Description**:
+
+      ```
+      {description}
+      ```
+
+      *   **License**: {license}
+      *   **Version**: {version}
+      *   **Splits**:
+      {splits}
+      *   **Features**:
+      {features}
+    """)
+
+    #       *   **Citation**: `{citation}`
+
+    def format_splits(split_infos: Sequence[dataset_info_pb2.SplitInfo]) -> str:
+      splits_str = ('\n').join(
+          sorted([
+              f'`\'{split.name}\'` | {sum(split.shard_lengths)}'
+              for split in split_infos
+          ]))
+      return textwrap.dedent(f"""
+            Split  | Examples
+            :----- | -------:
+            {py_utils.indent(splits_str, '            ')}
+            """)
+
+    def format_feature(feature: feature_pb2.Feature) -> str:
+      if feature.HasField('json_feature'):
+        return textwrap.dedent(f"""
+```json
+{feature.json_feature.json}
+```
+                               """)
+      if feature.HasField('features_dict'):
+        descriptions = [
+            f'    *   `{name}`'
+            for name, _ in feature.features_dict.features.items()
+        ]
+        return '\n'.join(descriptions)
+      return ''
+
+    def format_template(config_name: str,
+                        info: dataset_info_pb2.DatasetInfo) -> str:
+      if config_name == 'default':
+        tfds_id = self.tfds_id
+      else:
+        tfds_id = f'{self.tfds_id}/{config_name}'
+      content = template.format(
+          description=_clean_up_text(info.description),
+          tfds_id=tfds_id,
+          license=info.redistribution_info.license or 'No known license',
+          version=info.version,
+          splits=format_splits(info.splits),
+          features=format_feature(info.features),
+          citation=info.citation,
+      )
+      if config_name == 'default':
+        return content
+      return '{header}\n\n{content}'.format(
+          header=header_template.format(config_name=config_name),
+          content=content)
+
+    # homepage=default_dataset['homepage'],
+    config_descriptions = [
+        format_template(config_name, info)
+        for config_name, info in self.dataset_info_per_config().items()
+    ]
+
+    return '\n\n'.join(config_descriptions)
 
   def extra_links(self) -> Sequence[str]:
     """List of extra links (formatted in Markdown) relevant for this dataset."""
@@ -138,8 +264,84 @@ class HuggingfaceDatasetDocumentation(GithubDatasetDocumentation):
   def huggingface_link(self) -> str:
     return f'[Huggingface](https://huggingface.co/datasets/{self.name})'
 
+  @utils.memoized_property
+  def dataset_infos(self) -> utils.JsonValue:
+    """Retrieves the dataset info from either a locally cached copy or from Github."""
+
+    tmp_file_folder = f'/tmp/huggingface/{self.name}'
+    tmp_file_path = f'{tmp_file_folder}/dataset_infos.json'
+    os.makedirs(tmp_file_folder, exist_ok=True)
+
+    # TODO(weide) rewrite this to a context so we can use 'with cached_copy'
+    # TODO(weide) add flag to specify whether to use cached copies
+    def get_cached_copy(file_path: str, max_age_days: int) -> Optional[str]:
+      if os.path.isfile(file_path):
+        stats = os.stat(file_path)
+        modified_time = datetime.datetime.fromtimestamp(stats.st_mtime)
+        if modified_time > datetime.datetime.now() - datetime.timedelta(
+            days=max_age_days):
+          with open(file_path, 'r') as f:
+            return f.read()
+      return None
+
+    content = get_cached_copy(file_path=tmp_file_path, max_age_days=14)
+    if not content:
+      try:
+        dataset_info_path = self.gh_path / 'dataset_infos.json'
+        print(f'Retrieving {dataset_info_path.as_raw_url()}')
+        content = github_path.get_content(dataset_info_path.as_raw_url())
+        with open(tmp_file_path, 'w') as f:
+          f.write(content.decode())
+      except FileNotFoundError:
+        return {}
+    return json.loads(content)
+
   def extra_links(self) -> Sequence[str]:
     return [self.code_url(), self.huggingface_link()]
+
+  def _parse_dataset_info_proto(
+      self, config_name: str,
+      config: Mapping[str, Any]) -> dataset_info_pb2.DatasetInfo:
+    """Parses a DatasetInfo proto from the given Json."""
+
+    def get_features() -> feature_pb2.Feature:
+      return feature_pb2.Feature(
+          json_feature=feature_pb2.JsonFeature(
+              json=json.dumps(config['features'], indent=4)))
+
+    splits = []
+    for name, details in config['splits'].items():
+      splits.append(
+          dataset_info_pb2.SplitInfo(
+              name=name,
+              num_shards=1,
+              shard_lengths=[details['num_examples']],
+              num_bytes=details['num_bytes']))
+
+    if isinstance(config['version'], dict):
+      version = config['version']['version_str']
+    elif isinstance(config['version'], str):
+      version = config['version']
+    return dataset_info_pb2.DatasetInfo(
+        name=config_name,
+        module_name=config_name,
+        description=config['description'],
+        version=version,
+        citation=config['citation'],
+        redistribution_info=dataset_info_pb2.RedistributionInfo(
+            license=config['license']),
+        splits=splits,
+        features=get_features(),
+    )
+
+  def dataset_info_per_config(
+      self) -> Mapping[str, dataset_info_pb2.DatasetInfo]:
+    if not isinstance(self.dataset_infos, dict):
+      return {}
+    return {
+        config_name: self._parse_dataset_info_proto(config_name, config)
+        for config_name, config in self.dataset_infos.items()
+    }
 
 
 @dataclasses.dataclass()
@@ -163,10 +365,10 @@ class NamespaceFormatter:
         for ds in self.datasets
     ]
 
-  def to_details_markdown(self) -> str:
+  def to_namespace_overview(self) -> str:
     """Markdown with dataset details for the namespace dataset overview."""
     sections = '\n'.join(
-        [section.to_details_markdown() for section in self.sections()])
+        [section.to_namespace_overview() for section in self.sections()])
     template = textwrap.dedent("""
       # {self.name} datasets
 
@@ -187,7 +389,7 @@ class NamespaceFormatter:
 
   def to_toc_yaml(self, toc_relative_path: str):
     return _to_toc_yaml(
-        title=self.name, path=toc_relative_path, page=self.namespace)
+        title=self.name, relative_path=toc_relative_path, page=self.namespace)
 
 
 @dataclasses.dataclass()
@@ -200,14 +402,17 @@ class HuggingfaceFormatter(NamespaceFormatter):
         for ds in self.datasets
     ]
 
-  def to_details_markdown(self) -> str:
+  def to_namespace_overview(self) -> str:
+    for section in self.sections():
+      section.documentation()
     sections = '\n'.join(
-        [section.to_details_markdown() for section in self.sections()])
+        [section.to_namespace_overview() for section in self.sections()])
     template = textwrap.dedent("""\
       # Huggingface datasets
 
-      Huggingface has forked TFDS and provide a lot of text datasets. See
+      Huggingface has forked TFDS and provides a lot of text datasets. See
       [here](https://huggingface.co/docs/datasets/) for more documentation.
+      Next you can find the list of all the datasets that can be used with TFDS.
 
 
       {sections}
@@ -244,8 +449,15 @@ def build_namespace_details(
 ) -> Iterator[Tuple[str, str]]:
   """Generates all the detail pages for all namespaces and datasets."""
   for namespace, formatter in formatter_per_namespace.items():
-    details_markdown = formatter.to_details_markdown()
-    yield namespace, details_markdown
+    namespace_overview_markdown = formatter.to_namespace_overview()
+    yield namespace, namespace_overview_markdown
+
+
+def build_namespace_dataset_details(
+    formatter: NamespaceFormatter) -> Iterator[Tuple[str, str]]:
+  """Generates all the detail pages for all namespaces and datasets."""
+  for section in formatter.sections():
+    yield section.name, section.to_details_markdown()
 
 
 def build_toc_yaml(
@@ -254,9 +466,10 @@ def build_toc_yaml(
   """Returns a mapping representing the TOC (to be converted into Yaml)."""
   toc_relative_path = '/datasets/community_catalog'
   sections = [
-      _to_toc_yaml(title='Overview', path=toc_relative_path, page='overview')
+      _to_toc_yaml(
+          title='Overview', relative_path=toc_relative_path, page='overview')
   ]
-  for _, formatter in formatter_per_namespace.items():
+  for _, formatter in sorted(formatter_per_namespace.items()):
     sections.append(formatter.to_toc_yaml(toc_relative_path))
   return {'toc': sections}
 
@@ -278,6 +491,13 @@ def build_and_save_community_catalog(
   for namespace, details in build_namespace_details(formatter_per_namespace):
     namespace_file = catalog_dir / f'{namespace}.md'
     namespace_file.write_text(details)
+
+  for namespace, formatter in formatter_per_namespace.items():
+    namespace_folder = catalog_dir / namespace
+    namespace_folder.mkdir(exist_ok=True)
+    for dataset_name, markdown in build_namespace_dataset_details(formatter):
+      dataset_file = namespace_folder / f'{dataset_name}.md'
+      dataset_file.write_text(markdown)
 
 
 def _get_formatter_per_namespace(
