@@ -804,6 +804,24 @@ class FeatureConnector(object):
         info_str,
     )
 
+  def documentation_dict(self) -> Mapping[str, Mapping[str, str]]:
+    tensor_info = self.get_tensor_info()
+    if not isinstance(tensor_info, TensorInfo):
+      raise RuntimeError('Subclasses with nesting should override this method.')
+    if tensor_info.shape:
+      shape = str(tensor_info.shape)
+    else:
+      shape = ''
+    return {
+        '': {
+            'class': type(self).__name__,
+            'shape': shape,
+            'dtype': repr(tensor_info.dtype),
+            'description': self._doc.desc,
+            'value_range': self._doc.value_range,
+        }
+    }
+
   def save_metadata(self, data_dir, feature_name):
     """Save the feature metadata on disk.
 

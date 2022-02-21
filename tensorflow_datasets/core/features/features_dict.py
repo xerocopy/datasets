@@ -15,7 +15,7 @@
 
 """FeatureDict: Main feature connector container."""
 
-from typing import Dict, Union
+from typing import Dict, List, Mapping, Union
 
 import tensorflow as tf
 
@@ -168,6 +168,25 @@ class FeaturesDict(top_level_feature.TopLevelFeature):
       lines.extend('    ' + l for l in all_sub_lines.split('\n'))
     lines.append('})')
     return '\n'.join(lines)
+
+  def documentation_dict(self) -> Mapping[str, Mapping[str, str]]:
+    features_doc = {
+        '': {
+            'class': type(self).__name__,
+            'shape': '',
+            'dtype': '',
+            'description': self._doc.desc,
+            'value_range': self._doc.value_range,
+        }
+    }
+    for feature_name, feature in sorted(list(self._feature_dict.items())):
+      for sub_name, documentation in feature.documentation_dict().items():
+        if sub_name:
+          nested_name = f'{feature_name}/{sub_name}'
+        else:
+          nested_name = feature_name
+        features_doc[nested_name] = documentation
+    return features_doc
 
   @py_utils.memoize()
   def get_tensor_info(self):

@@ -15,7 +15,7 @@
 
 """Sequence feature."""
 
-from typing import Optional, Union
+from typing import Mapping, Optional, Union
 
 import numpy as np
 import tensorflow as tf
@@ -201,6 +201,18 @@ class Sequence(top_level_feature.TopLevelFeature):
       # Minor formatting cleaning: 'Sequence(FeaturesDict({' => 'Sequence({'
       inner_feature_repr = inner_feature_repr[len('FeaturesDict('):-len(')')]
     return '{}({})'.format(type(self).__name__, inner_feature_repr)
+
+  def documentation_dict(self) -> Mapping[str, Mapping[str, str]]:
+    result = {}
+    inner_feature_doc = self._feature.documentation_dict()
+    for k, v in inner_feature_doc.items():
+      result[k] = dict(v)
+    # Override the nested FeaturesDict to become a Sequence.
+    if '' in result:
+      result['']['class'] = type(self).__name__
+      result['']['description'] = self._doc.desc
+      result['']['value_range'] = self._doc.value_range
+    return result
 
   @classmethod
   def from_json_content(

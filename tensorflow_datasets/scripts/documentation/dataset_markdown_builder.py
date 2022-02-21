@@ -372,18 +372,60 @@ class SplitInfoSection(Section):
 
 class FeatureInfoSection(Section):
 
-  NAME = 'Features'
+  NAME = 'Feature structure'
 
   def get_key(self, builder: tfds.core.DatasetBuilder):
     return repr(builder.info.features)
 
-  def content(self, builder: tfds.core.DatasetBuilder):
+  def features_content(self, features: tfds.features.FeatureConnector) -> Block:
     code = textwrap.dedent("""
         ```python
         {}
         ```
-        """).format(builder.info.features)
+        """).format(features)
     return Block(code)
+
+  def content(self, builder: tfds.core.DatasetBuilder):
+    return self.features_content(builder.info.features)
+
+
+class FeatureDocumentationSection(Section):
+
+  NAME = 'Feature documentation'
+
+  def get_key(self, builder: tfds.core.DatasetBuilder):
+    return repr(builder.info.features)
+
+  def _format_feature_rows(
+      self,
+      features: tfds.features.FeatureConnector,
+  ) -> List[str]:
+    """Return the formatted rows for each feature (sorted by feature name)."""
+
+    def format_row(feature_name: str, doc) -> str:
+      parts = [
+          feature_name, doc['class'], doc['shape'], doc['dtype'],
+          doc['description'], doc['value_range']
+      ]
+      parts = [part or '' for part in parts]
+      return ' | '.join(parts)
+
+    rows = []
+    for feature_name, doc_row in sorted(
+        list(features.documentation_dict().items())):
+      rows.append(format_row(feature_name, doc_row))
+    return rows
+
+  def content(self, builder: tfds.core.DatasetBuilder) -> Block:
+    # TODO(b/220268235) only show value range column if there are any values.
+    rows = self._format_feature_rows(builder.info.features)
+    features_str = '\n'.join(rows)
+    return Block(
+        textwrap.dedent(f"""
+            Feature | Class | Shape | Dtype | Description | Value range
+            :------ | ----- | ----- | ----- | ----------- | -----------
+            {features_str}
+            """))
 
 
 class SupervisedKeySection(Section):
